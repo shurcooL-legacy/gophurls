@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"html/template"
@@ -12,6 +13,7 @@ import (
 	"code.google.com/p/go.net/html/atom"
 
 	. "gist.github.com/5286084.git"
+	"github.com/shurcooL/go-goon"
 )
 
 var _ = CheckError
@@ -20,6 +22,11 @@ var httpAddr = flag.String("http", ":7000", "HTTP service address")
 
 var data struct {
 	Urls []UrlTitle
+	sync.RWMutex
+}
+
+var peers2 struct {
+	Peers []string
 	sync.RWMutex
 }
 
@@ -93,13 +100,41 @@ func lookupTitle(url string) (title string) {
 }
 
 func addLink(url UrlTitle) {
+	data.RLock()
+	for _, oldurl := range data.Urls {
+		if url.URL == oldurl.URL {
+			data.RUnlock()
+			return
+		}
+	}
+	data.RUnlock()
+
 	if url.Title == "" {
 		url.Title = lookupTitle(url.URL)
 	}
 
+	go broadcastToPeers(url)
+
 	data.Lock()
 	defer data.Unlock()
 	data.Urls = append(data.Urls, url)
+}
+
+func broadcastToPeers(url UrlTitle) {
+	peers2.RLock()
+	defer peers2.RUnlock()
+
+	for _, peer := range peers2.Peers {
+		go broadcastToPeer(peer, url)
+	}
+}
+
+func broadcastToPeer(peer string, url UrlTitle) {
+	b, err := json.Marshal(url)
+	CheckError(err)
+
+	resp, err := http.Post(peer, "application/json", bytes.NewReader(b))
+	goon.DumpExpr(resp, err)
 }
 
 func links(w http.ResponseWriter, r *http.Request) {
@@ -110,7 +145,21 @@ func links(w http.ResponseWriter, r *http.Request) {
 			log.Fatal(err)
 		}
 
-		addLink(url)
+		go addLink(url)
+	}
+}
+
+func peersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		dec := json.NewDecoder(r.Body)
+		var peers []string
+		if err := dec.Decode(&peers); err != io.EOF && err != nil {
+			log.Fatal(err)
+		}
+
+		peers2.Lock()
+		defer peers2.Unlock()
+		peers2.Peers = peers
 	}
 }
 
@@ -119,6 +168,7 @@ func init() {
 	// doesn't run when testing.)
 	http.HandleFunc("/", home)
 	http.HandleFunc("/links", links)
+	http.HandleFunc("/peers", peersHandler)
 }
 
 func main() {
